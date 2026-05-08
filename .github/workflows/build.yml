@@ -4,7 +4,7 @@ on:
   # Daily at 13:00 UTC = 6 AM PDT / 5 AM PST.
   # The Pacific morning, before any same-day event traffic.
   schedule:
-    - cron: "0 13 * * *"
+    - cron: "30 8 * * *"
 
   # Manual trigger button in the Actions tab — use this if you add
   # a same-day event and want the page refreshed immediately.
