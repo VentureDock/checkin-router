@@ -1,0 +1,56 @@
+name: Build & deploy check-in router
+
+on:
+  # Daily at 13:00 UTC = 6 AM PDT / 5 AM PST.
+  # The Pacific morning, before any same-day event traffic.
+  schedule:
+    - cron: "0 13 * * *"
+
+  # Manual trigger button in the Actions tab — use this if you add
+  # a same-day event and want the page refreshed immediately.
+  workflow_dispatch:
+
+  # Rebuild on pushes to main so style/script changes take effect.
+  push:
+    branches: [main]
+
+# Single concurrent run; later runs cancel earlier in-flight ones.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build router page
+        env:
+          LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+          VENUE_TIMEZONE: America/Los_Angeles
+        run: python scripts/build.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
