@@ -37,6 +37,12 @@ BRAND = {
     "card_bg": "#ffffff",
 }
 
+# Permanent "walk-in" Luma event for any visitor not here for a scheduled event
+# (tour, meeting, member guest, vendor, etc.). Always shown on the router page —
+# as a secondary CTA below the event cards on populated days, and as the primary
+# CTA on days with no events.
+WALKIN_URL = "https://luma.com/7lj9bcpe"
+
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "public"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -105,12 +111,13 @@ def render(events: list[dict], today: dt.date, generated_at: dt.datetime) -> str
     )
 
     if events:
-        cards_html = "\n".join(render_card(ev) for ev in events)
+        # Populated day: event cards, then a smaller walk-in CTA below.
+        event_cards = "\n".join(render_card(ev) for ev in events)
+        walkin = render_walkin_secondary()
+        cards_html = event_cards + "\n" + walkin
     else:
-        cards_html = (
-            '<div class="empty">No events scheduled at the Dock today.<br>'
-            "If you're here for something, please ask the front desk.</div>"
-        )
+        # Empty day: walk-in CTA is the primary action (replaces "no events" message).
+        cards_html = render_walkin_primary()
 
     return TEMPLATE.format(
         brand=BRAND,
@@ -139,6 +146,26 @@ def render_card(ev: dict) -> str:
           <div class="card-time">{when}</div>
           <div class="card-name">{name}</div>
           <div class="card-cta">Tap to check in &rarr;</div>
+        </a>"""
+
+
+def render_walkin_secondary() -> str:
+    """Smaller walk-in CTA shown below event cards on populated days."""
+    return f"""\
+        <div class="walkin-divider"><span>or</span></div>
+        <a class="walkin walkin-secondary" href="{html.escape(WALKIN_URL)}" target="_top" rel="noopener">
+          <div class="walkin-headline">Visiting for something else?</div>
+          <div class="walkin-sub">Tour, meeting, member guest, or other &mdash; sign in here &rarr;</div>
+        </a>"""
+
+
+def render_walkin_primary() -> str:
+    """Larger walk-in CTA shown when there are no scheduled events today."""
+    return f"""\
+        <div class="empty-note">No scheduled events at the Dock today.</div>
+        <a class="walkin walkin-primary" href="{html.escape(WALKIN_URL)}" target="_top" rel="noopener">
+          <div class="walkin-headline">Sign in for your visit</div>
+          <div class="walkin-sub">Tour, meeting, member guest, vendor, or other &mdash; tap to check in.</div>
         </a>"""
 
 
@@ -230,14 +257,69 @@ TEMPLATE = """<!doctype html>
     font-size: 14px;
     color: var(--muted);
   }}
-  .empty {{
-    background: var(--card-bg);
-    border: 1.5px dashed rgba(0,0,0,0.15);
-    border-radius: 14px;
-    padding: 28px 20px;
+  .empty-note {{
     text-align: center;
     color: var(--muted);
-    line-height: 1.5;
+    font-size: 15px;
+    margin: 4px 0 6px;
+  }}
+  .walkin-divider {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 0;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }}
+  .walkin-divider::before,
+  .walkin-divider::after {{
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: rgba(0,0,0,0.08);
+  }}
+  .walkin {{
+    display: block;
+    background: var(--card-bg);
+    border-radius: 14px;
+    text-decoration: none;
+    color: var(--ink);
+    transition: transform 80ms ease, border-color 80ms ease, box-shadow 80ms ease;
+  }}
+  .walkin:active {{ transform: scale(0.99); }}
+  .walkin-secondary {{
+    border: 1.5px dashed rgba(0,0,0,0.18);
+    padding: 16px 20px;
+    text-align: center;
+  }}
+  .walkin-secondary:hover {{
+    border-color: var(--color);
+    border-style: solid;
+  }}
+  .walkin-primary {{
+    border: 1.5px solid rgba(0,0,0,0.06);
+    border-left: 5px solid var(--color);
+    padding: 22px 20px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }}
+  .walkin-primary:hover {{
+    border-color: var(--color);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  }}
+  .walkin-headline {{
+    font-size: 17px;
+    font-weight: 600;
+    line-height: 1.3;
+    margin-bottom: 4px;
+  }}
+  .walkin-primary .walkin-headline {{
+    font-size: 19px;
+  }}
+  .walkin-sub {{
+    font-size: 14px;
+    color: var(--muted);
   }}
   footer {{
     margin-top: 36px;
