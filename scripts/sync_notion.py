@@ -11,10 +11,14 @@ Design notes
 ------------
 * The script is idempotent. Re-running it produces the same Notion state.
 * User-editable fields (Notes, Tags, Owner) are never touched.
-* For past events older than 7 days, we skip the expensive guest-list
-  paginate and reuse the counts already in Notion — those numbers will
-  not change. This keeps each run under ~3 minutes and respects Luma's
+* For past events older than FRESHNESS_DAYS days, we skip the expensive
+  guest-list paginate and reuse the counts already in Notion — those
+  numbers will not change. This keeps each run fast and respects Luma's
   aggressive rate limits.
+* Events whose deep-fetch fails on the first pass (typically a 429 from
+  Luma running out of token budget on a big event) are collected and
+  retried at the end of the run after a cooldown. This makes the script
+  self-healing within a single run.
 * This is a pre-Supabase bridge. When the Data Ecosystem Architecture's
   Phase 1 is live (Luma → Supabase via webhook), retire this script and
   point Notion at Supabase via Metabase instead.
@@ -27,6 +31,11 @@ NOTION_DATABASE_ID    required, UUID of the Notion database to write to
 VENUE_TIMEZONE        optional, defaults to America/Los_Angeles
 FRESHNESS_DAYS        optional, default 7. Past events older than this
                       skip the deep-fetch of their guest list.
+RETRY_COOLDOWN_SEC    optional, default 60. Pause between main pass and
+                      retry pass.
+RETRY_MAX_PASSES      optional, default 2. Number of retry sweeps after
+                      the initial pass (1 = single retry, 2 = retry then
+                      retry the retry).
 DRY_RUN               optional, "1" to log changes without writing
 """
 
@@ -41,7 +50,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Iterable
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
@@ -52,6 +60,8 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 VENUE_TZ = ZoneInfo(os.environ.get("VENUE_TIMEZONE", "America/Los_Angeles"))
 FRESHNESS_DAYS = int(os.environ.get("FRESHNESS_DAYS", "7"))
+RETRY_COOLDOWN_SEC = int(os.environ.get("RETRY_COOLDOWN_SEC", "60"))
+RETRY_MAX_PASSES = int(os.environ.get("RETRY_MAX_PASSES", "2"))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
 LUMA_BASE = "https://api.lu.ma/public/v1"
@@ -65,15 +75,13 @@ if not NOTION_TOKEN:
 if not NOTION_DATABASE_ID:
     sys.exit("NOTION_DATABASE_ID env var not set")
 
-# ---------------------------------------------------------------------------
-# Logging helper — write to stderr so workflow logs stay readable.
 
 def log(msg: str) -> None:
     print(f"[{dt.datetime.utcnow().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter for Luma. Token bucket at ~3 req/s.
+# Rate limiter for Luma. Token bucket.
 
 class RateLimiter:
     def __init__(self, rate: float, capacity: int):
@@ -96,7 +104,7 @@ class RateLimiter:
 
 
 LUMA_RL = RateLimiter(rate=3, capacity=3)
-NOTION_RL = RateLimiter(rate=2.5, capacity=3)  # Notion docs say ~3/s
+NOTION_RL = RateLimiter(rate=2.5, capacity=3)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +144,7 @@ def luma_get(path: str, params: dict | None = None) -> dict:
         url += "?" + urllib.parse.urlencode(params)
     headers = {
         "x-luma-api-key": LUMA_API_KEY,
-        "User-Agent": "venturedock-sync/1.0",
+        "User-Agent": "venturedock-sync/1.1",
         "Accept": "application/json",
     }
     return http("GET", url, headers, None)
@@ -158,7 +166,7 @@ def notion_request(method: str, path: str, body: dict | None = None) -> dict:
 def fetch_all_events() -> list[dict]:
     events: list[dict] = []
     cursor = None
-    for _ in range(50):  # safety cap
+    for _ in range(50):
         params = {}
         if cursor:
             params["pagination_cursor"] = cursor
@@ -171,7 +179,6 @@ def fetch_all_events() -> list[dict]:
 
 
 def fetch_guest_counts(event_api_id: str) -> dict:
-    """Paginate /event/get-guests and tally each status category."""
     counts = {"invited": 0, "approved": 0, "checked_in": 0,
               "pending_approval": 0, "declined": 0, "waitlist": 0,
               "total_guests": 0}
@@ -202,17 +209,16 @@ def fetch_guest_counts(event_api_id: str) -> dict:
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-        if pages > 200:  # safety cap, 10k guests
+        if pages > 200:
             log(f"  WARN: pagination cap hit for {event_api_id}")
             break
     return counts
 
 
 # ---------------------------------------------------------------------------
-# Notion data access — query existing rows, parse, build {event_api_id → row}
+# Notion data access
 
 def get_existing_rows() -> dict[str, dict]:
-    """Return {event_api_id: page_dict} for everything currently in the DB."""
     rows: dict[str, dict] = {}
     cursor: str | None = None
     while True:
@@ -225,7 +231,6 @@ def get_existing_rows() -> dict[str, dict]:
             eid_prop = props.get("Event API ID", {}).get("rich_text") or []
             eid = "".join(p.get("plain_text", "") for p in eid_prop).strip()
             if not eid:
-                # row without an API ID — orphan, ignore for matching
                 continue
             rows[eid] = page
         if not data.get("has_more"):
@@ -235,7 +240,6 @@ def get_existing_rows() -> dict[str, dict]:
 
 
 def existing_counts(page: dict) -> dict:
-    """Pull current count values out of a Notion page, used to skip stale-deep-fetch."""
     out: dict[str, int | None] = {}
     props = page.get("properties", {})
     for name, key in [
@@ -306,18 +310,84 @@ def build_props(event: dict, counts: dict, now_iso: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main sync
+# Per-event sync — returns True on success, False on retryable failure.
+
+def sync_one(
+    ev: dict,
+    existing: dict[str, dict],
+    freshness_cutoff_date: dt.date,
+    now_iso: str,
+    stats: dict,
+) -> bool:
+    eid = ev.get("api_id") or ev.get("id")
+    if not eid:
+        return True  # nothing to do
+
+    start = parse_iso(ev.get("start_at"))
+    is_past_stale = (
+        start is not None
+        and start.astimezone(VENUE_TZ).date() < freshness_cutoff_date
+        and eid in existing
+    )
+
+    if is_past_stale:
+        ec = existing_counts(existing[eid])
+        if any(v is None for v in ec.values()):
+            log(f"  {eid} past but counts incomplete — deep-fetching")
+            try:
+                counts = fetch_guest_counts(eid)
+            except Exception as e:
+                log(f"  ERROR fetching {eid}: {e}")
+                return False
+        else:
+            counts = {k: int(v) for k, v in ec.items()}  # type: ignore
+            stats["skipped_fresh"] += 1
+    else:
+        try:
+            counts = fetch_guest_counts(eid)
+        except Exception as e:
+            log(f"  ERROR fetching {eid}: {e}")
+            return False
+
+    props = build_props(ev, counts, now_iso)
+
+    if eid in existing:
+        page_id = existing[eid]["id"]
+        if not DRY_RUN:
+            try:
+                notion_request("PATCH", f"/pages/{page_id}", {"properties": props})
+            except Exception as e:
+                log(f"  ERROR updating Notion page for {eid}: {e}")
+                return False
+        stats["updated"] += 1
+    else:
+        body = {
+            "parent": {"database_id": NOTION_DATABASE_ID},
+            "properties": props,
+        }
+        if not DRY_RUN:
+            try:
+                notion_request("POST", "/pages", body)
+            except Exception as e:
+                log(f"  ERROR creating Notion page for {eid}: {e}")
+                return False
+        stats["created"] += 1
+        log(f"  created {eid} ({ev.get('name','')[:50]})")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
 
 def main() -> int:
     log("Starting Luma → Notion sync")
     if DRY_RUN:
         log("DRY_RUN=1 — no writes will be made")
 
-    # 1) Pull Luma events list (cheap)
     luma_events = fetch_all_events()
     log(f"Luma calendar: {len(luma_events)} events")
 
-    # 2) Pull current Notion rows
     existing = get_existing_rows()
     log(f"Notion DB: {len(existing)} existing rows")
 
@@ -325,76 +395,41 @@ def main() -> int:
     now_iso = now_utc.isoformat()
     freshness_cutoff_date = (now_utc - dt.timedelta(days=FRESHNESS_DAYS)).date()
 
-    created = updated = skipped_fresh = skipped_old = errors = 0
-    luma_ids = set()
+    stats = {"created": 0, "updated": 0, "skipped_fresh": 0}
+    failed: list[dict] = []
+    luma_ids: set[str] = set()
 
+    # Pass 1: main loop
+    log("=== Pass 1 (initial) ===")
     for i, ev in enumerate(luma_events):
         eid = ev.get("api_id") or ev.get("id")
         if not eid:
             continue
         luma_ids.add(eid)
+        if not sync_one(ev, existing, freshness_cutoff_date, now_iso, stats):
+            failed.append(ev)
+        if (i + 1) % 10 == 0:
+            log(f"  progress {i+1}/{len(luma_events)} (failures so far: {len(failed)})")
 
-        start = parse_iso(ev.get("start_at"))
-        is_past_stale = (
-            start is not None
-            and start.astimezone(VENUE_TZ).date() < freshness_cutoff_date
-            and eid in existing
-        )
-
-        if is_past_stale:
-            # Reuse counts already in Notion. We still bump status/dates/etc.
-            existing_page = existing[eid]
-            ec = existing_counts(existing_page)
-            # If any count is None (row was created but never filled), do a fresh fetch
-            if any(v is None for v in ec.values()):
-                log(f"  [{i+1}/{len(luma_events)}] {eid} past but counts incomplete — deep-fetching")
-                try:
-                    counts = fetch_guest_counts(eid)
-                except Exception as e:
-                    log(f"  ERROR fetching {eid}: {e}")
-                    errors += 1
-                    continue
+    # Retry passes — events that failed get a cooldown then another shot.
+    for pass_num in range(1, RETRY_MAX_PASSES + 1):
+        if not failed:
+            break
+        log(f"=== Pass {pass_num + 1} (retry) — {len(failed)} event(s) failed, cooling down {RETRY_COOLDOWN_SEC}s ===")
+        time.sleep(RETRY_COOLDOWN_SEC)
+        to_retry = failed
+        failed = []
+        # Refresh Notion-side state in case the cooldown took us across other events being touched.
+        # Skipping the refresh — DB doesn't change under us during a run.
+        for ev in to_retry:
+            eid = ev.get("api_id") or ev.get("id")
+            ok = sync_one(ev, existing, freshness_cutoff_date, now_iso, stats)
+            if not ok:
+                failed.append(ev)
             else:
-                counts = {k: int(v) for k, v in ec.items()}  # type: ignore
-                skipped_fresh += 1
-        else:
-            try:
-                counts = fetch_guest_counts(eid)
-            except Exception as e:
-                log(f"  ERROR fetching {eid}: {e}")
-                errors += 1
-                continue
+                log(f"  ✓ recovered {eid} on retry pass {pass_num + 1}")
 
-        props = build_props(ev, counts, now_iso)
-
-        if eid in existing:
-            page_id = existing[eid]["id"]
-            if not DRY_RUN:
-                try:
-                    notion_request("PATCH", f"/pages/{page_id}", {"properties": props})
-                except Exception as e:
-                    log(f"  ERROR updating Notion page for {eid}: {e}")
-                    errors += 1
-                    continue
-            updated += 1
-            if (i + 1) % 10 == 0 or skipped_fresh == 0:
-                log(f"  [{i+1}/{len(luma_events)}] updated {eid} ({ev.get('name','')[:40]})")
-        else:
-            body = {
-                "parent": {"database_id": NOTION_DATABASE_ID},
-                "properties": props,
-            }
-            if not DRY_RUN:
-                try:
-                    notion_request("POST", "/pages", body)
-                except Exception as e:
-                    log(f"  ERROR creating Notion page for {eid}: {e}")
-                    errors += 1
-                    continue
-            created += 1
-            log(f"  [{i+1}/{len(luma_events)}] created {eid} ({ev.get('name','')[:40]})")
-
-    # 3) Archive Notion rows whose event no longer exists on the calendar
+    # Archive Notion rows whose event no longer exists on the calendar.
     archived = 0
     for eid, page in existing.items():
         if eid in luma_ids:
@@ -412,18 +447,22 @@ def main() -> int:
                 })
             except Exception as e:
                 log(f"  ERROR archiving {eid}: {e}")
-                errors += 1
                 continue
         archived += 1
         log(f"  archived {eid}")
 
+    final_errors = len(failed)
     log("Sync complete")
-    log(f"  created       : {created}")
-    log(f"  updated       : {updated}")
-    log(f"  skipped (old) : {skipped_fresh}")
-    log(f"  archived      : {archived}")
-    log(f"  errors        : {errors}")
-    return 0 if errors == 0 else 1
+    log(f"  created          : {stats['created']}")
+    log(f"  updated          : {stats['updated']}")
+    log(f"  skipped (old)    : {stats['skipped_fresh']}")
+    log(f"  archived         : {archived}")
+    log(f"  unresolved errs  : {final_errors}")
+    if final_errors:
+        for ev in failed:
+            log(f"    - {ev.get('api_id')} {ev.get('name','')[:60]}")
+
+    return 0 if final_errors == 0 else 1
 
 
 if __name__ == "__main__":
