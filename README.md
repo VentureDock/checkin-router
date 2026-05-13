@@ -22,8 +22,12 @@ front-desk QR  →  https://checkin.venturedock.com/  →  list of today's event
 
 ```
 .
-├── .github/workflows/build.yml   GitHub Action: cron + manual trigger + push
-├── scripts/build.py              Fetch Luma events, render index.html
+├── .github/workflows/
+│   ├── build.yml                 Build & deploy the check-in router page
+│   └── sync-notion.yml           Sync Luma event counts to a Notion database
+├── scripts/
+│   ├── build.py                  Fetch Luma events, render index.html
+│   └── sync_notion.py            Sync Luma event counts to Notion (2x daily)
 ├── public/
 │   ├── index.html                Generated; what GitHub Pages serves
 │   ├── 404.html                  Redirects unknown paths back to /
@@ -31,6 +35,11 @@ front-desk QR  →  https://checkin.venturedock.com/  →  list of today's event
 ├── README.md
 └── .gitignore
 ```
+
+This repo contains **two independent workflows**:
+
+1. **Check-in router** (`build.yml` + `build.py`) — public-facing page at `checkin.venturedock.com`.
+2. **Notion sync** (`sync-notion.yml` + `sync_notion.py`) — internal pipeline that mirrors per-event counts into a Notion database for the ops team. Runs twice daily.
 
 ## One-time setup
 
@@ -114,6 +123,92 @@ reception.
 5. Save. The next daily build picks it up automatically; if the event
    is happening today, run the workflow manually from the Actions tab
    to refresh the page right away.
+
+## Notion sync (twice-daily Luma → Notion)
+
+A second workflow mirrors per-event counts into a Notion database for
+the ops team. Runs at ~7:30 AM PT and ~7:30 PM PT.
+
+**Notion DB:** `Luma Events — Auto-synced`, lives under the Venture
+Dock Hub page. URL:
+https://www.notion.so/bf256519c4fa406e8fb18cb8e0a51f15
+
+**Properties written by the sync (do not edit manually — they get
+overwritten):**
+
+- Event (title), Date, Status, Visibility, Luma URL, Event API ID
+- Invited, Approved, Checked-in, Pending, Declined, Waitlist, Total guests
+- Accept rate (formula), Show rate (formula)
+- Last synced (timestamp)
+
+**Properties safe for the ops team to use (sync ignores them):**
+
+- Notes, Tags, Owner
+
+**Status transitions** are based on the event's Luma start date:
+
+- `Upcoming` — start date is in the future
+- `Today` — start date is today (in the venue's timezone)
+- `Past` — start date is in the past
+- `Archived` — event no longer exists on the Luma calendar; the row is
+  kept for history but no longer updated
+- `Draft` — event has no start date (rare)
+
+### Setup steps
+
+#### Notion side
+
+1. Create an internal integration:
+   - https://www.notion.so/profile/integrations → **New integration**
+   - Type: Internal integration
+   - Name: `Venture Dock Sync`
+   - Workspace: the Venture Dock workspace
+   - Copy the **Internal Integration Secret** (starts with `ntn_…`)
+
+2. Share the database with the integration:
+   - Open `Luma Events — Auto-synced` in Notion
+   - Click the `…` menu top-right → **Connections** → **Add connections**
+   - Find and add `Venture Dock Sync`
+
+3. Copy the database ID:
+   - From the URL: `notion.so/<DATABASE_ID>?v=…` (the 32-char hex segment)
+   - Current DB ID: `bf256519c4fa406e8fb18cb8e0a51f15`
+
+#### GitHub side
+
+Repo `Settings → Secrets and variables → Actions → New repository secret`.
+Add two secrets (you already have `LUMA_API_KEY`):
+
+- Name: `NOTION_TOKEN`, value: the `ntn_…` token from step 1.
+- Name: `NOTION_DATABASE_ID`, value: `bf256519c4fa406e8fb18cb8e0a51f15`.
+
+#### Run it
+
+`Actions → Sync Luma events to Notion → Run workflow`. First run takes
+~3–5 min (full backfill across all events). Subsequent runs skip
+deep-fetching past events older than 7 days, so each run completes in
+~30–90 seconds.
+
+### When this gets retired
+
+This sync is a **pre-Supabase bridge**. The Data Ecosystem Architecture
+routes Luma → Supabase via native webhook, with Notion reading from
+Supabase via Metabase rather than being a direct sync target. Once
+Phase 1 of the spec is live, retire this workflow:
+
+- Disable the cron in `sync-notion.yml`
+- Leave the Notion DB in place for history, but stop writing to it
+- Point new dashboards at Metabase / Supabase
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Workflow fails with `NOTION_TOKEN env var not set` | Secret missing or misnamed. Re-add under repo settings. |
+| Workflow runs but no rows appear | Integration not added to the database. In Notion, open the DB → `…` menu → Connections → Add `Venture Dock Sync`. |
+| 429 errors in the log | Luma rate-limited the deep fetch. The script retries automatically; if a run dies, the next scheduled run picks up where it left off (idempotent). |
+| A row in Notion has a stale count | Edit the Notion row's `Last synced` field to clear it, then trigger the workflow manually. The script will re-fetch. |
+| You need to backfill a row's guest list right now | Run the workflow manually from the Actions tab. |
 
 ## Customizing the look
 
